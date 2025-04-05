@@ -1,0 +1,278 @@
+---
+title: "Latent supervision"
+output:
+  html_document: default
+  pdf_document: default
+date: "2025-03-23"
+---
+##### This document provides a code-based tutorial demonstrating how to use latent supervision to train machine learning classification models. 
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(randomLCA)
+```
+
+## Infectious Keratitis Latent Supervision Example
+
+### Step 1: Latent Class Analysis
+We generate several candidate LCA models using the randomLCA package (Beath KJ. randomLCA: An R Package for Latent Class with Random Effects Analysis. Journal of Statistical Software, 81(13):1-25)
+```{r,include=FALSE}
+# Load the corneal ulcer dataset
+ulcer_filepath <- '/Users/redd/Library/Mobile Documents/com~apple~CloudDocs/Desktop/Latent Supervision Trachoma/Latent supervision code repo/corneal ulcer dataset.csv'
+ulcer_dataset <- read_csv(ulcer_filepath)
+```
+
+```{r}
+# Fit several candidate LCA models using indicator columns 2 to 5 (the smear and culture results)
+# One class model
+one_class_LCA <- randomLCA(ulcer_dataset[2:5],nclass=1,seed=42)
+
+# Two class model
+two_class_LCA <- randomLCA(ulcer_dataset[2:5],nclass=2,seed=42)
+
+# Two class model with random effects and variable loadings
+two_class_random_LCA <- randomLCA(ulcer_dataset[2:5],nclass=2,seed=42,random=TRUE,constload=FALSE)
+
+# Two class model with random effects and constant loadings
+two_class_random_const_LCA <- randomLCA(ulcer_dataset[2:5],nclass=2,seed=42,random=TRUE,constload=TRUE)
+```
+
+We compare the performance of the models, primarily using the lowest BIC as our selection criterion
+```{r}
+one_class_LCA
+```
+```{r}
+two_class_LCA
+```
+```{r}
+two_class_random_LCA
+```
+```{r}
+two_class_random_const_LCA
+```
+
+We obtain a substantial reduction in the BIC by adding the second latent class to the model, and achieve the lowest BIC by adding random effects with variable loading. Based on this we will use "two_class_random_LCA" as our final model. Based on the conditional probabilities resulting from this model, it appears that class 1 is most likely bacterial keratitis, and class 2 is fungal keratitis. We can estimate the following parameters:
+
+Fungal smear (KOH): sensitivity = 94%, specificity = 100%
+Bacterial smear (Gram stain): sensitivity = 23%, specificity = 100%
+Fungal culture (potato dextrose agar): sensitivity = 70%, specificity = 100%
+Bacterial culture (blood agar): sensitivity = 21%, specificity = 99%
+
+### Step 2: Bayesian Posterior Probability Estimation
+```{r}
+# Define a function based on Bayes' theorem
+Bayes <- function(Ptest_given_disease, # The conditional probability of obtaining the test result given that disease is present
+                  Ptest_given_no_disease, # The conditional probability of obtaining the test result given that disease is absent
+                  prior) # The prior probability that disease is present
+  {
+  Pdisease = prior # The probability that disease is present
+  Pno_disease = 1-prior # The probability that disease is absent
+  Ptest = (Ptest_given_disease*Pdisease) + (Ptest_given_no_disease*Pno_disease) # The probability of obtaining the test result (the sum of the probability that the test is positive when disease is present and the probability that the test is positive when disease is absent)
+  posterior = ((Ptest_given_disease * prior)/Ptest) # Bayes' theorem
+  return(posterior)
+}
+```
+
+```{r}
+extract_conditional_probs <- function(lca_model) {
+  # Convert the outcomep matrix to a data frame
+  cond_prob <- as.data.frame(lca_model$outcomep)
+  
+  # Determine the number of indicators from the outcomep matrix
+  n_indicators <- ncol(cond_prob)
+  
+  # Extract indicator names from the patterns table.
+  # Assume the first n_indicators columns of lca_model$patterns correspond to the indicators.
+  indicator_names <- colnames(lca_model$patterns)[1:n_indicators]
+  
+  # If indicator_names are missing, fall back to generic names.
+  if (is.null(indicator_names)) {
+    indicator_names <- paste0("Test", seq_len(n_indicators))
+  }
+  
+  # Assign the extracted names to the columns of the conditional probability table
+  colnames(cond_prob) <- indicator_names
+  
+  # Create generic class names if row names are missing
+  if (is.null(rownames(cond_prob))) {
+    rownames(cond_prob) <- paste0("Class_", seq_len(nrow(cond_prob)))
+  }
+  
+  # Add the class names as a column for tidying
+  cond_prob <- cond_prob %>%
+    mutate(Class = rownames(cond_prob))
+  
+  # Convert to long format: one row per (Class, Indicator) combination
+  cond_prob_long <- cond_prob %>%
+    pivot_longer(
+      cols = -Class,
+      names_to = "Indicator",
+      values_to = "P_positive"
+    ) %>%
+    mutate(P_negative = 1 - P_positive)
+  
+  # Extract the class probabilities (prevalences)
+  # If names are not provided, assign generic class names.
+  if (is.null(names(lca_model$classp))) {
+    class_names <- paste0("Class_", seq_along(lca_model$classp))
+  } else {
+    class_names <- names(lca_model$classp)
+  }
+  
+  class_probs <- tibble(
+    Class = class_names,
+    Prevalence = lca_model$classp
+  )
+  
+  # Return a list containing both conditional probabilities and class probabilities
+  return(list(cond_probs = cond_prob_long, class_probs = class_probs))
+}
+```
+
+```{r}
+update_posterior_from_lca_vectorized <- function(lca_model, test_df, target_class = NULL, selected_indicators = NULL) {
+  # --- Step 1: Calculate the Conditional Probability Matrix ---
+  # Get the outcomep matrix and assign indicator names from the patterns table.
+  Pmat <- lca_model$outcomep
+  n_indicators <- ncol(Pmat)
+  ind_names <- colnames(lca_model$patterns)[1:n_indicators]
+  colnames(Pmat) <- ind_names
+  
+  # If user specifies selected indicators, use those.
+  if (!is.null(selected_indicators)) {
+    if (!all(selected_indicators %in% ind_names)) {
+      stop("Not all specified indicators are present in the LCA model.")
+    }
+    ind_names <- selected_indicators
+  }
+  
+  # Ensure that the class names (rownames) are unique.
+  if (is.null(rownames(Pmat))) {
+    rownames(Pmat) <- paste0("Class_", seq_len(nrow(Pmat)))
+  } else {
+    rownames(Pmat) <- make.unique(rownames(Pmat))
+  }
+  classes <- rownames(Pmat)
+  
+  # Subset the conditional probability matrix to only the selected indicators.
+  Pmat <- Pmat[, ind_names, drop = FALSE]
+  
+  # --- Step 2: Prepare the Test Data ---
+  if (!all(ind_names %in% names(test_df))) {
+    stop("Not all indicator columns found in the test dataframe.")
+  }
+  test_mat <- as.matrix(test_df[, ind_names])
+  n_subjects <- nrow(test_mat)
+  n_class <- nrow(Pmat)
+  
+  # --- Step 3: Compute Log Likelihoods for Each Subject and Class ---
+  logL <- matrix(0, nrow = n_subjects, ncol = n_class)
+  for (j in 1:n_class) {
+    logP <- log(Pmat[j, ])
+    logOneMinusP <- log(1 - Pmat[j, ])
+    logL[, j] <- rowSums(
+      test_mat * matrix(logP, n_subjects, length(ind_names), byrow = TRUE) +
+      (1 - test_mat) * matrix(logOneMinusP, n_subjects, length(ind_names), byrow = TRUE)
+    )
+  }
+  Lmat <- exp(logL)
+  colnames(Lmat) <- classes
+  
+  # --- Step 4: Incorporate Class Priors ---
+  prior_vec <- lca_model$classp
+  if (is.null(names(prior_vec))) {
+    names(prior_vec) <- classes
+  } else {
+    names(prior_vec) <- make.unique(names(prior_vec))
+  }
+  post_unnorm <- sweep(Lmat, 2, prior_vec, FUN = "*")
+  post_norm <- post_unnorm / rowSums(post_unnorm)
+  colnames(post_norm) <- classes  # Ensure names match.
+  
+  # --- Step 5: Return the Result ---
+  if (!is.null(target_class)) {
+    if (is.numeric(target_class)) {
+      target_class <- paste0("Class_", target_class)
+    }
+    if (!target_class %in% colnames(post_norm)) {
+      stop("Target class not found in the LCA model.")
+    }
+    return(post_norm[, target_class, drop = TRUE])
+  }
+  
+  return(post_norm)
+}
+
+```
+
+```{r}
+ulcer_dataset$bac_post_prob <- update_posterior_from_lca_vectorized(
+  lca_model = two_class_random_LCA,
+  test_df = ulcer_dataset,
+  selected_indicators = c("bac_smear", "bac_cult_positive"),
+  target_class = 1  # For bacterial keratitis
+)
+
+ulcer_dataset$fung_post_prob <- update_posterior_from_lca_vectorized(
+  lca_model = two_class_random_LCA,
+  test_df = ulcer_dataset,
+  selected_indicators = c("fung_smear", "fung_cult_positive"),
+  target_class = 2  # For fungal keratitis
+)
+
+ulcer_dataset %>%
+  select(`Study ID`, bac_post_prob, fung_post_prob)
+```
+### Step 3: Train a classifier using the probabilistic labels
+In this example we will use Keras to train a simple neural network in R, but any classifier can be trained using the probabilistic labels obtained in Step 2 and the modified MSE loss function defined below
+```{r}
+# library(keras)
+# 
+# rescaled_MSE <- function(y_true, y_pred) {
+#   mse <- k_square(y_true - y_pred)
+#   rescaled_mse <- mse * 10
+#   loss <- k_mean(rescaled_mse, axis = -1)
+#   return(loss)
+# }
+# 
+# # Define a simple neural network model
+# model <- keras_model_sequential() %>%
+#   layer_dense(units = 8, activation = "relu", input_shape = ncol(X)) %>%
+#   layer_dense(units = 4, activation = "relu") %>%
+#   layer_dense(units = 1, activation = "sigmoid")
+# 
+# # Compile the model using the rescaled MSE loss function
+# model %>% compile(
+#   loss = rescaled_MSE,
+#   optimizer = optimizer_adam()
+# )
+```
+The model can then be fit and evaluated
+
+## Trachoma Example
+### Step 1: Latent Class Analysis
+```{r,include=FALSE}
+# Load the trachoma dataset
+trachoma_filepath <- '/Users/redd/Library/Mobile Documents/com~apple~CloudDocs/Desktop/Latent Supervision Trachoma/Latent supervision code repo/trachoma dataset.csv'
+trachoma_dataset <- read_csv(trachoma_filepath)
+```
+
+```{r}
+# Fit a two-class LCA model for the trachoma dataset
+trachoma_LCA <- randomLCA(trachoma_dataset, nclass = 2, seed = 22)
+trachoma_LCA
+```
+
+### Step 2: Bayesian Posterior Probability Estimation
+```{r}
+trachoma_dataset$TF_post_prob <- update_posterior_from_lca_vectorized(
+  lca_model = trachoma_LCA,
+  test_df = trachoma_dataset,
+  target_class = 1
+)
+
+trachoma_dataset
+```
+### Step 3
+The same principles apply as in the infectious keratitis example described above
