@@ -19,7 +19,6 @@ library(randomLCA)
 We generate several candidate LCA models using the randomLCA package (Beath KJ. randomLCA: An R Package for Latent Class with Random Effects Analysis. Journal of Statistical Software, 81(13):1-25)
 ```{r,include=FALSE}
 # Load the corneal ulcer dataset
-ulcer_filepath <- '/Users/redd/Library/Mobile Documents/com~apple~CloudDocs/Desktop/Latent Supervision Trachoma/Latent supervision code repo/corneal ulcer dataset.csv'
 ulcer_dataset <- read_csv(ulcer_filepath)
 ```
 
@@ -227,26 +226,26 @@ ulcer_dataset %>%
 ### Step 3: Train a classifier using the probabilistic labels
 In this example we will use Keras to train a simple neural network in R, but any classifier can be trained using the probabilistic labels obtained in Step 2 and the modified MSE loss function defined below
 ```{r}
-# library(keras)
-# 
-# rescaled_MSE <- function(y_true, y_pred) {
-#   mse <- k_square(y_true - y_pred)
-#   rescaled_mse <- mse * 10
-#   loss <- k_mean(rescaled_mse, axis = -1)
-#   return(loss)
-# }
-# 
-# # Define a simple neural network model
-# model <- keras_model_sequential() %>%
-#   layer_dense(units = 8, activation = "relu", input_shape = ncol(X)) %>%
-#   layer_dense(units = 4, activation = "relu") %>%
-#   layer_dense(units = 1, activation = "sigmoid")
-# 
-# # Compile the model using the rescaled MSE loss function
-# model %>% compile(
-#   loss = rescaled_MSE,
-#   optimizer = optimizer_adam()
-# )
+library(keras)
+
+rescaled_MSE <- function(y_true, y_pred) {
+  mse <- k_square(y_true - y_pred)
+  rescaled_mse <- mse * 10
+  loss <- k_mean(rescaled_mse, axis = -1)
+  return(loss)
+}
+
+# Define a simple neural network model
+model <- keras_model_sequential() %>%
+  layer_dense(units = 8, activation = "relu", input_shape = ncol(X)) %>%
+  layer_dense(units = 4, activation = "relu") %>%
+  layer_dense(units = 1, activation = "sigmoid")
+
+# Compile the model using the rescaled MSE loss function
+model %>% compile(
+  loss = rescaled_MSE,
+  optimizer = optimizer_adam()
+)
 ```
 The model can then be fit and evaluated
 
@@ -254,7 +253,6 @@ The model can then be fit and evaluated
 ### Step 1: Latent Class Analysis
 ```{r,include=FALSE}
 # Load the trachoma dataset
-trachoma_filepath <- '/Users/redd/Library/Mobile Documents/com~apple~CloudDocs/Desktop/Latent Supervision Trachoma/Latent supervision code repo/trachoma dataset.csv'
 trachoma_dataset <- read_csv(trachoma_filepath)
 ```
 
