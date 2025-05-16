@@ -11,12 +11,16 @@ date: "2025-03-23"
 knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
 library(randomLCA)
+library(keras)
+library(tensorflow)
 ```
 
 ## Infectious Keratitis Latent Supervision Example
 
 ### Step 1: Latent Class Analysis
-We generate several candidate LCA models using the randomLCA package (Beath KJ. randomLCA: An R Package for Latent Class with Random Effects Analysis. Journal of Statistical Software, 81(13):1-25)
+We generate several candidate LCA models using the randomLCA package 
+*(Beath KJ. randomLCA: An R Package for Latent Class with Random Effects Analysis. Journal of Statistical Software, 81(13):1-25)*
+
 ```{r,include=FALSE}
 # Load the corneal ulcer dataset
 ulcer_dataset <- read_csv(ulcer_filepath)
@@ -38,17 +42,18 @@ two_class_random_const_LCA <- randomLCA(ulcer_dataset[2:5],nclass=2,seed=42,rand
 ```
 
 We compare the performance of the models, primarily using the lowest BIC as our selection criterion
-```{r}
-one_class_LCA
-```
-```{r}
-two_class_LCA
-```
-```{r}
-two_class_random_LCA
-```
-```{r}
-two_class_random_const_LCA
+```{r lca_keratitis_results_comparison, echo=TRUE}
+print("One Class LCA:")
+print(one_class_LCA) # Or summary(one_class_LCA) for more details if available
+
+print("Two Class LCA:")
+print(two_class_LCA)
+
+print("Two Class Random LCA (Variable Loadings):")
+print(two_class_random_LCA)
+
+print("Two Class Random LCA (Constant Loadings):")
+print(two_class_random_const_LCA)
 ```
 
 We obtain a substantial reduction in the BIC by adding the second latent class to the model, and achieve the lowest BIC by adding random effects with variable loading. Based on this we will use "two_class_random_LCA" as our final model. Based on the conditional probabilities resulting from this model, it appears that class 1 is most likely bacterial keratitis, and class 2 is fungal keratitis. We can estimate the following parameters:
@@ -59,7 +64,7 @@ Fungal culture (potato dextrose agar): sensitivity = 70%, specificity = 100%
 Bacterial culture (blood agar): sensitivity = 21%, specificity = 99%
 
 ### Step 2: Bayesian Posterior Probability Estimation
-```{r}
+```{r bayes_function_definition, echo=TRUE}
 # Define a function based on Bayes' theorem
 Bayes <- function(Ptest_given_disease, # The conditional probability of obtaining the test result given that disease is present
                   Ptest_given_no_disease, # The conditional probability of obtaining the test result given that disease is absent
@@ -224,30 +229,110 @@ ulcer_dataset %>%
   select(`Study ID`, bac_post_prob, fung_post_prob)
 ```
 ### Step 3: Train a classifier using the probabilistic labels
-In this example we will use Keras to train a simple neural network in R, but any classifier can be trained using the probabilistic labels obtained in Step 2 and the modified MSE loss function defined below
+In this example we will use Keras to train an EfficientNet deep CNN in R, but any classifier can be trained using the probabilistic labels obtained in Step 2 and the modified MSE loss function defined below
 ```{r}
 library(keras)
+library(tensorflow)
 
+# Define metrics
+metrics_list <- list(
+  "accuracy",
+  metric_auc(name = "auroc"),
+  metric_auc(name = "auprc", curve = "PR"),
+  metric_precision(name = "precision"),
+  metric_recall(name = "recall")
+)
+
+# Data augmentation pipeline
+data_augmentation <- keras_model_sequential() %>%
+  layer_random_rotation(factor = 0.15) %>%
+  layer_random_translation(height_factor = 0.1, width_factor = 0.1) %>%
+  layer_random_flip() %>%
+  layer_random_contrast(factor = 0.1)
+
+# Custom loss function: rescaled MSE
 rescaled_MSE <- function(y_true, y_pred) {
-  mse <- k_square(y_true - y_pred)
-  rescaled_mse <- mse * 10
-  loss <- k_mean(rescaled_mse, axis = -1)
-  return(loss)
+  mse <- tf$math$square(y_true - y_pred)
+  rescaled_mse <- tf$math$multiply(mse, 10)
+  loss <- tf$math$reduce_mean(rescaled_mse, axis = -1L)
+  loss
 }
 
-# Define a simple neural network model
-model <- keras_model_sequential() %>%
-  layer_dense(units = 8, activation = "relu", input_shape = ncol(X)) %>%
-  layer_dense(units = 4, activation = "relu") %>%
-  layer_dense(units = 1, activation = "sigmoid")
+# Build the EfficientNetB7 model
+build_weak_ENB7 <- function(DROPOUT, LR) {
+  inputs <- layer_input(shape = c(600, 600, 3))
+  aug_inputs <- inputs %>% data_augmentation
 
-# Compile the model using the rescaled MSE loss function
-model %>% compile(
-  loss = rescaled_MSE,
-  optimizer = optimizer_adam()
-)
+  base <- application_efficientnet_b7(
+    include_top = FALSE,
+    input_tensor = aug_inputs,
+    weights = "imagenet"
+  )
+  base$trainable <- FALSE
+
+  x <- base$output %>%
+    layer_global_average_pooling_2d(name = "avg_pool") %>%
+    layer_batch_normalization() %>%
+    layer_dense(units = 512, activation = "relu") %>%
+    layer_dropout(rate = DROPOUT) %>%
+    layer_dense(units = 32, activation = "relu") %>%
+    layer_dropout(rate = DROPOUT) %>%
+    layer_dense(units = 2, activation = "sigmoid")
+
+  model <- keras_model(inputs = inputs, outputs = x)
+
+  model %>% compile(
+    optimizer = optimizer_rmsprop(learning_rate = LR, clipnorm = 1),
+    loss = rescaled_MSE,
+    metrics = metrics_list
+  )
+
+  model
+}
+
+# EfficientNet block cut points
+ENB0_blocks <- c(8, 18, 47, 76, 120, 163, 222)   # 4M params, 238 layers
+ENB1_blocks <- c(8, 30, 74, 118, 177, 235, 309)  # 6.5M params, 340 layers
+ENB2_blocks <- c(8, 30, 74, 118, 177, 235, 309)  # 7.8M params, 340 layers
+ENB3_blocks <- c(8, 30, 74, 118, 192, 265, 354)  # 10.8M params, 385 layers
+ENB4_blocks <- c(8, 30, 89, 148, 237, 325, 444)  # 17.7M params, 475 layers
+ENB5_blocks <- c(8, 42, 116, 190, 294, 397, 531) # 28.5M params, 577 layers
+ENB6_blocks <- c(8, 42, 131, 220, 339, 457, 621) # 41.0M params, 667 layers
+ENB7_blocks <- c(8, 54, 158, 262, 411, 559, 753) # 64.1M params, 814 layers
+
+# Which layer to start unfreezing
+FROZEN_LAYER <- ENB7_blocks[1]
+
+# Function to unfreeze from a given layer onward (except BatchNorm) and recompile
+unfreeze_weak_model <- function(model, FROZEN_LAYER, LR) {
+  for (i in seq(FROZEN_LAYER, length(model$layers))) {
+    layer <- model$layers[[i]]
+    if (!inherits(layer, "BatchNormalization")) {
+      layer$trainable <- TRUE
+    }
+  }
+  model %>% compile(
+    optimizer = optimizer_rmsprop(learning_rate = LR, clipnorm = 1),
+    loss = rescaled_MSE,
+    metrics = metrics_list
+  )
+  model
+}
 ```
-The model can then be fit and evaluated
+The model can then be instantiated, fit, and evaluated
+```{r}
+model <- build_weak_ENB7(DROPOUT = 0.3, LR = 1e-5)
+model <- unfreeze_weak_model(model, FROZEN_LAYER, LR=1e-5)
+
+# Train the model
+history <- model %>% fit(
+  train_dataset,
+  validation_data = val_dataset
+)
+
+# Evaluate on the test set
+results <- model %>% evaluate(test_dataset)
+```
 
 ## Trachoma Example
 ### Step 1: Latent Class Analysis
@@ -269,8 +354,77 @@ trachoma_dataset$TF_post_prob <- update_posterior_from_lca_vectorized(
   test_df = trachoma_dataset,
   target_class = 1
 )
-
-trachoma_dataset
 ```
 ### Step 3
-The same principles apply as in the infectious keratitis example described above
+The same principles apply as in the infectious keratitis example described above. In this case we used a MobileNetV3 model with Adam optimizer.
+
+```{r}
+library(keras)
+library(tensorflow)
+
+# Build the MobileNet model
+build_weak_MNV3 <- function(DROPOUT=0.3, LR=1e-5) {
+  inputs <- layer_input(shape = c(224, 224, 3))
+  aug_inputs <- inputs %>% data_augmentation
+
+  base <- application_mobilenet_v3_large(
+    include_top = FALSE,
+    input_tensor = aug_inputs,
+    weights = "imagenet"
+  )
+  base$trainable <- FALSE
+
+  x <- base$output %>%
+    layer_global_average_pooling_2d(name = "avg_pool") %>%
+    layer_batch_normalization() %>%
+    layer_dense(units = 512, activation = "relu") %>%
+    layer_dropout(rate = DROPOUT) %>%
+    layer_dense(units = 32, activation = "relu") %>%
+    layer_dropout(rate = DROPOUT) %>%
+    layer_dense(units = 2, activation = "sigmoid")
+
+  model <- keras_model(inputs = inputs, outputs = x)
+
+  model %>% compile(
+    optimizer = optimizer_adam(learning_rate = LR, clipnorm = 1),
+    loss = rescaled_MSE,
+    metrics = metrics_list
+  )
+
+  model
+}
+
+# Define which layer to start unfreezing
+FROZEN_LAYER <- 45
+LR <- 1e-5
+
+# Function to unfreeze from a given layer onward (except BatchNorm) and recompile
+unfreeze_weak_model <- function(model, FROZEN_LAYER, LR) {
+  for (i in seq(FROZEN_LAYER, length(model$layers))) {
+    layer <- model$layers[[i]]
+    if (!inherits(layer, "BatchNormalization")) {
+      layer$trainable <- TRUE
+    }
+  }
+  model %>% compile(
+    optimizer = optimizer_adam(learning_rate = LR, clipnorm = 1),
+    loss = rescaled_MSE,
+    metrics = metrics_list
+  )
+  model
+}
+```
+The model can then be instantiated, fit, and evaluated
+```{r}
+model <- build_weak_MNV3()
+model <- unfreeze_weak_model(model, FROZEN_LAYER, LR)
+
+# Train the model
+history <- model %>% fit(
+  train_dataset,
+  validation_data = val_dataset
+)
+
+# Evaluate on the test set
+results <- model %>% evaluate(test_dataset)
+```
